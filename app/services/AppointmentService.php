@@ -1,0 +1,526 @@
+<?php
+
+declare(strict_types=1);
+
+namespace App\Services;
+
+use App\Models\Appointment;
+use App\Models\Patient;
+use App\Models\ActivityLog;
+use App\Models\Notification;
+use App\Services\NotificationService;
+use App\Core\Database;
+use RuntimeException;
+
+class AppointmentService
+{
+    private Appointment $appointmentModel;
+    private Patient $patientModel;
+    private ActivityLog $activityLog;
+    private Notification $notificationModel;
+    private NotificationService $notificationService;
+    private Database $db;
+
+    public function __construct()
+    {
+        $this->appointmentModel = new Appointment();
+        $this->patientModel = new Patient();
+        $this->activityLog = new ActivityLog();
+        $this->notificationModel = new Notification();
+        $this->notificationService = new NotificationService();
+        $this->db = Database::getInstance();
+    }
+
+    /**
+     * Book a new appointment with double-booking prevention.
+     */
+    public function bookAppointment(array $data, int $createdBy): array
+    {
+        // Validate the appointment date is not in the past
+        if (strtotime($data['appointment_date']) < strtotime('today')) {
+            return ['success' => false, 'message' => 'Cannot book appointments in the past.'];
+        }
+
+        // Check advance booking limit
+        $config = require dirname(__DIR__, 2) . '/config/app.php';
+        $maxDays = $config['security']['cancellation_hours'] ?? 60;
+
+        $this->db->beginTransaction();
+        try {
+            // Double-booking prevention: check within transaction
+            $duration = (int) ($data['duration'] ?? 30);
+            $endTime = date('H:i:s', strtotime($data['appointment_time']) + ($duration * 60));
+
+            if ($this->appointmentModel->hasOverlap(
+                (int) $data['doctor_id'],
+                $data['appointment_date'],
+                $data['appointment_time'],
+                $endTime
+            )) {
+                $this->db->rollback();
+                return ['success' => false, 'message' => 'This time slot is no longer available. Please choose another.'];
+            }
+
+            $appointmentId = $this->appointmentModel->create([
+                'patient_id' => (int) $data['patient_id'],
+                'doctor_id' => (int) $data['doctor_id'],
+                'appointment_date' => $data['appointment_date'],
+                'appointment_time' => $data['appointment_time'],
+                'end_time' => $endTime,
+                'type' => $data['type'] ?? 'CONSULTATION',
+                'reason' => $data['reason'] ?? null,
+                'duration' => $duration,
+                'created_by' => $createdBy,
+            ]);
+
+            $this->db->commit();
+
+            // Send notifications
+            $this->sendAppointmentNotifications($appointmentId, 'booked');
+
+            $this->activityLog->log('APPOINTMENT_CREATED', $createdBy, 'appointment', $appointmentId,
+                "Appointment booked for " . $data['appointment_date'] . " at " . $data['appointment_time']);
+
+            return [
+                'success' => true,
+                'message' => 'Appointment booked successfully.',
+                'data' => ['appointment_id' => $appointmentId],
+            ];
+        } catch (\Throwable $e) {
+            $this->db->rollback();
+            throw $e;
+        }
+    }
+
+    /**
+     * Update appointment status.
+     */
+    public function updateStatus(int $appointmentId, string $status, int $userId, ?string $reason = null): array
+    {
+        $appointment = $this->appointmentModel->find($appointmentId);
+        if (!$appointment) {
+            return ['success' => false, 'message' => 'Appointment not found.'];
+        }
+
+        $validTransitions = [
+            'SCHEDULED' => ['CONFIRMED', 'CANCELLED', 'WAITLISTED'],
+            'CONFIRMED' => ['IN_PROGRESS', 'CANCELLED', 'NO_SHOW'],
+            'IN_PROGRESS' => ['COMPLETED'],
+            'WAITLISTED' => ['SCHEDULED', 'CANCELLED'],
+        ];
+
+        $currentStatus = $appointment['status'];
+        if (!isset($validTransitions[$currentStatus]) || !in_array($status, $validTransitions[$currentStatus])) {
+            return ['success' => false, 'message' => "Cannot change status from $currentStatus to $status."];
+        }
+
+        $updateData = ['status' => $status];
+
+        if ($status === 'CANCELLED') {
+            // Enforce cancellation policy
+            $config = require dirname(__DIR__, 2) . '/config/app.php';
+            $cancelHours = $config['security']['cancellation_hours'];
+            $appointmentDateTime = strtotime($appointment['appointment_date'] . ' ' . $appointment['appointment_time']);
+
+            if ($appointmentDateTime - time() < ($cancelHours * 3600)) {
+                // Late cancellation - log but still allow
+                $this->activityLog->log('LATE_CANCELLATION', $userId, 'appointment', $appointmentId,
+                    "Appointment cancelled within {$cancelHours}h policy window");
+            }
+
+            $updateData['cancellation_reason'] = $reason;
+            $updateData['cancelled_at'] = date('Y-m-d H:i:s');
+
+            // Check waitlist and notify
+            $this->processWaitlist($appointment);
+        }
+
+        $this->appointmentModel->updateById($appointmentId, $updateData);
+        $this->sendAppointmentNotifications($appointmentId, strtolower($status));
+
+        $this->activityLog->log('APPOINTMENT_STATUS_CHANGE', $userId, 'appointment', $appointmentId,
+            "Status changed from $currentStatus to $status");
+
+        return ['success' => true, 'message' => "Appointment {$status} successfully."];
+    }
+
+    /**
+     * Reschedule / edit an existing appointment.
+     *
+     * Only SCHEDULED or CONFIRMED appointments that have not yet occurred can be edited.
+     * Allowed fields: appointment_date, appointment_time, type, reason, duration.
+     */
+    public function editAppointment(int $appointmentId, array $data, int $userId): array
+    {
+        $appointment = $this->appointmentModel->find($appointmentId);
+        if (!$appointment) {
+            return ['success' => false, 'message' => 'Appointment not found.'];
+        }
+
+        if (!in_array($appointment['status'], ['SCHEDULED', 'CONFIRMED'], true)) {
+            return ['success' => false, 'message' => 'Only upcoming appointments can be edited.'];
+        }
+
+        $newDate = $data['appointment_date'] ?? $appointment['appointment_date'];
+        $newTime = $data['appointment_time'] ?? $appointment['appointment_time'];
+
+        if (strtotime($newDate) < strtotime('today')) {
+            return ['success' => false, 'message' => 'Cannot reschedule to a date in the past.'];
+        }
+
+        $duration = (int) ($data['duration'] ?? $appointment['duration'] ?? 30);
+        $endTime = date('H:i:s', strtotime($newTime) + ($duration * 60));
+
+        $this->db->beginTransaction();
+        try {
+            if ($this->appointmentModel->hasOverlap(
+                (int) $appointment['doctor_id'],
+                $newDate,
+                $newTime,
+                $endTime,
+                $appointmentId
+            )) {
+                $this->db->rollback();
+                return ['success' => false, 'message' => 'This time slot is no longer available. Please choose another.'];
+            }
+
+            $updateData = [
+                'appointment_date' => $newDate,
+                'appointment_time' => $newTime,
+                'end_time' => $endTime,
+                'duration' => $duration,
+                'type' => $data['type'] ?? $appointment['type'],
+                'reason' => $data['reason'] ?? $appointment['reason'],
+                'status' => 'SCHEDULED',
+            ];
+
+            $this->appointmentModel->updateById($appointmentId, $updateData);
+            $this->db->commit();
+
+            $this->sendAppointmentNotifications($appointmentId, 'rescheduled');
+
+            $this->activityLog->log('APPOINTMENT_RESCHEDULED', $userId, 'appointment', $appointmentId,
+                "Rescheduled from {$appointment['appointment_date']} {$appointment['appointment_time']} to {$newDate} {$newTime}");
+
+            return ['success' => true, 'message' => 'Appointment updated successfully.'];
+        } catch (\Throwable $e) {
+            $this->db->rollback();
+            throw $e;
+        }
+    }
+
+    /**
+     * Get available time slots for a doctor on a given date.
+     */
+    public function getAvailableSlots(int $doctorId, string $date): array
+    {
+        return $this->appointmentModel->getAvailableSlots($doctorId, $date);
+    }
+
+    /**
+     * Get appointment details.
+     */
+    public function getDetails(int $appointmentId): ?array
+    {
+        return $this->appointmentModel->getWithDetails($appointmentId);
+    }
+
+    /**
+     * Get appointments with filtering.
+     */
+    public function getFiltered(array $filters, int $page = 1, int $perPage = 15): array
+    {
+        $sql = "SELECT a.*, p.first_name AS patient_first_name, p.last_name AS patient_last_name,
+                       d.first_name AS doctor_first_name, d.last_name AS doctor_last_name
+                FROM appointments a
+                JOIN patients p ON a.patient_id = p.id
+                JOIN users d ON a.doctor_id = d.id
+                WHERE 1=1";
+        $countSql = "SELECT COUNT(*) FROM appointments a
+                     JOIN patients p ON a.patient_id = p.id
+                     WHERE 1=1";
+        $params = [];
+        $countParams = [];
+
+        if (!empty($filters['doctor_id'])) {
+            $sql .= " AND a.doctor_id = ?";
+            $countSql .= " AND a.doctor_id = ?";
+            $params[] = $filters['doctor_id'];
+            $countParams[] = $filters['doctor_id'];
+        }
+
+        if (!empty($filters['patient_id'])) {
+            $sql .= " AND a.patient_id = ?";
+            $countSql .= " AND a.patient_id = ?";
+            $params[] = $filters['patient_id'];
+            $countParams[] = $filters['patient_id'];
+        }
+
+        if (!empty($filters['parent_id'])) {
+            $sql .= " AND p.parent_id = ?";
+            $countSql .= " AND p.parent_id = ?";
+            $params[] = $filters['parent_id'];
+            $countParams[] = $filters['parent_id'];
+        }
+
+        if (!empty($filters['date_from'])) {
+            $sql .= " AND a.appointment_date >= ?";
+            $countSql .= " AND a.appointment_date >= ?";
+            $params[] = $filters['date_from'];
+            $countParams[] = $filters['date_from'];
+        }
+
+        if (!empty($filters['date_to'])) {
+            $sql .= " AND a.appointment_date <= ?";
+            $countSql .= " AND a.appointment_date <= ?";
+            $params[] = $filters['date_to'];
+            $countParams[] = $filters['date_to'];
+        }
+
+        if (!empty($filters['status'])) {
+            $sql .= " AND a.status = ?";
+            $countSql .= " AND a.status = ?";
+            $params[] = $filters['status'];
+            $countParams[] = $filters['status'];
+        }
+
+        $total = (int) $this->db->fetchColumn($countSql, $countParams);
+        $offset = ($page - 1) * $perPage;
+
+        $sql .= " ORDER BY a.appointment_date DESC, a.appointment_time DESC LIMIT ? OFFSET ?";
+        $params[] = $perPage;
+        $params[] = $offset;
+
+        $data = $this->db->fetchAll($sql, $params);
+
+        return [
+            'data' => $data,
+            'pagination' => [
+                'current_page' => $page,
+                'per_page' => $perPage,
+                'total' => $total,
+                'total_pages' => (int) ceil($total / $perPage),
+            ],
+        ];
+    }
+
+    /**
+     * Add to waitlist.
+     */
+    public function addToWaitlist(array $data, int $createdBy): array
+    {
+        $id = $this->db->insert('appointment_waitlist', [
+            'patient_id' => (int) $data['patient_id'],
+            'doctor_id' => (int) $data['doctor_id'],
+            'preferred_date' => $data['preferred_date'],
+            'preferred_time_start' => $data['preferred_time_start'] ?? null,
+            'preferred_time_end' => $data['preferred_time_end'] ?? null,
+            'type' => $data['type'] ?? 'CONSULTATION',
+            'reason' => $data['reason'] ?? null,
+            'created_by' => $createdBy,
+            'expires_at' => date('Y-m-d H:i:s', strtotime($data['preferred_date'] . ' +1 day')),
+        ]);
+
+        return [
+            'success' => true,
+            'message' => 'Added to waitlist. You will be notified if a slot opens up.',
+            'data' => ['waitlist_id' => $id],
+        ];
+    }
+
+    /**
+     * Process waitlist when an appointment is cancelled.
+     */
+    private function processWaitlist(array $cancelledAppointment): void
+    {
+        $waitlistEntries = $this->db->fetchAll(
+            "SELECT w.*, p.parent_id FROM appointment_waitlist w
+             JOIN patients p ON w.patient_id = p.id
+             WHERE w.doctor_id = ? AND w.preferred_date = ? AND w.status = 'WAITING'
+             ORDER BY w.created_at ASC LIMIT 1",
+            [$cancelledAppointment['doctor_id'], $cancelledAppointment['appointment_date']]
+        );
+
+        foreach ($waitlistEntries as $entry) {
+            $this->db->update('appointment_waitlist', [
+                'status' => 'OFFERED',
+                'notified_at' => date('Y-m-d H:i:s'),
+            ], 'id = ?', [$entry['id']]);
+
+            $this->notificationModel->createNotification(
+                $entry['parent_id'],
+                'Appointment Slot Available',
+                'A slot has opened up for your waitlisted appointment. Please book soon!',
+                'APPOINTMENT',
+                'ALL',
+                'waitlist',
+                $entry['id']
+            );
+        }
+    }
+
+    /**
+     * Send notifications for appointment events.
+     *
+     * Creates an in-app notification AND emails the parent/doctor so they
+     * also get a copy in their inbox (e.g. "Appointment Confirmed").
+     */
+    private function sendAppointmentNotifications(int $appointmentId, string $event): void
+    {
+        $appointment = $this->appointmentModel->getWithDetails($appointmentId);
+        if (!$appointment) {
+            return;
+        }
+
+        $parent = $this->db->fetchOne(
+            "SELECT u.id, u.email, u.first_name AS parent_first_name, u.last_name AS parent_last_name
+             FROM patients p JOIN users u ON u.id = p.parent_id WHERE p.id = ?",
+            [$appointment['patient_id']]
+        );
+        $doctor = $this->db->fetchOne(
+            "SELECT id, email, first_name, last_name FROM users WHERE id = ?",
+            [$appointment['doctor_id']]
+        );
+
+        $titles = [
+            'booked' => 'Appointment Booked',
+            'confirmed' => 'Appointment Confirmed',
+            'cancelled' => 'Appointment Cancelled',
+            'completed' => 'Appointment Completed',
+            'in_progress' => 'Appointment In Progress',
+            'no_show' => 'Appointment Marked No-Show',
+            'waitlisted' => 'Appointment Waitlisted',
+        ];
+
+        $title = $titles[$event] ?? 'Appointment Update';
+        $date = date('M j, Y', strtotime($appointment['appointment_date']));
+        $time = date('g:i A', strtotime($appointment['appointment_time']));
+        $type = $appointment['type'] ?? 'CONSULTATION';
+        $doctorName = "Dr. {$appointment['doctor_first_name']} {$appointment['doctor_last_name']}";
+        $patientName = trim($appointment['patient_first_name'] . ' ' . $appointment['patient_last_name']);
+
+        // Notify parent (in-app + email)
+        if ($parent) {
+            $parentMessage = "Appointment for {$appointment['patient_first_name']} on {$date} at {$time} has been {$event}.";
+
+            $this->notificationModel->createNotification(
+                (int) $parent['id'],
+                $title,
+                $parentMessage,
+                'APPOINTMENT',
+                'ALL',
+                'appointment',
+                $appointmentId
+            );
+
+            if (!empty($parent['email'])) {
+                $body = $this->buildAppointmentEmailBody(
+                    title: $title,
+                    greeting: "Hi {$parent['parent_first_name']},",
+                    intro: $parentMessage,
+                    patientName: $patientName,
+                    date: $date,
+                    time: $time,
+                    type: $type,
+                    counterpart: $doctorName,
+                    reason: $appointment['reason'] ?? null,
+                    cancellationReason: $appointment['cancellation_reason'] ?? null
+                );
+                $this->notificationService->sendEmail($parent['email'], "{$title} - PediCare Clinic", $body);
+            }
+        }
+
+        // Notify admins + superadmins (in-app only) so they can see parent-driven
+        // reschedules and cancellations from their dashboards too. Only fire on
+        // events that change the schedule — skip "booked" since the admin can
+        // see new bookings live in the appointments list.
+        $broadcastEvents = ['rescheduled', 'cancelled', 'no_show'];
+        if (in_array($event, $broadcastEvents, true)) {
+            $staff = $this->db->fetchAll(
+                "SELECT id FROM users WHERE user_type IN ('ADMIN', 'SUPERADMIN') AND status = 'active'"
+            );
+            $staffMessage = "Parent updated appointment for {$patientName} with {$doctorName} on {$date} at {$time}: {$event}.";
+            foreach ($staff as $s) {
+                $this->notificationModel->createNotification(
+                    (int) $s['id'],
+                    $title,
+                    $staffMessage,
+                    'APPOINTMENT',
+                    'IN_APP',
+                    'appointment',
+                    $appointmentId
+                );
+            }
+        }
+
+        // Notify doctor (in-app + email)
+        if ($doctor) {
+            $doctorMessage = "Appointment with {$patientName} on {$date} at {$time} has been {$event}.";
+
+            $this->notificationModel->createNotification(
+                (int) $doctor['id'],
+                $title,
+                $doctorMessage,
+                'APPOINTMENT',
+                'ALL',
+                'appointment',
+                $appointmentId
+            );
+
+            if (!empty($doctor['email'])) {
+                $body = $this->buildAppointmentEmailBody(
+                    title: $title,
+                    greeting: "Hi Dr. {$doctor['first_name']},",
+                    intro: $doctorMessage,
+                    patientName: $patientName,
+                    date: $date,
+                    time: $time,
+                    type: $type,
+                    counterpart: $parent ? "{$parent['parent_first_name']} {$parent['parent_last_name']}" : 'Parent',
+                    reason: $appointment['reason'] ?? null,
+                    cancellationReason: $appointment['cancellation_reason'] ?? null
+                );
+                $this->notificationService->sendEmail($doctor['email'], "{$title} - PediCare Clinic", $body);
+            }
+        }
+    }
+
+    /**
+     * Build the HTML body for an appointment-event email.
+     */
+    private function buildAppointmentEmailBody(
+        string $title,
+        string $greeting,
+        string $intro,
+        string $patientName,
+        string $date,
+        string $time,
+        string $type,
+        string $counterpart,
+        ?string $reason,
+        ?string $cancellationReason
+    ): string {
+        $reasonRow = $reason
+            ? "<tr><td style='padding:6px 0;color:#777;'>Reason</td><td style='padding:6px 0;'>" . htmlspecialchars($reason) . "</td></tr>"
+            : '';
+        $cancelRow = $cancellationReason
+            ? "<tr><td style='padding:6px 0;color:#777;'>Cancellation reason</td><td style='padding:6px 0;'>" . htmlspecialchars($cancellationReason) . "</td></tr>"
+            : '';
+
+        return "
+            <h2 style='color:#FF6B9A;margin-top:0;'>{$title}</h2>
+            <p>" . htmlspecialchars($greeting) . "</p>
+            <p>" . htmlspecialchars($intro) . "</p>
+            <table style='width:100%;border-collapse:collapse;margin:16px 0;font-size:14px;'>
+                <tr><td style='padding:6px 0;color:#777;'>Patient</td><td style='padding:6px 0;'>" . htmlspecialchars($patientName) . "</td></tr>
+                <tr><td style='padding:6px 0;color:#777;'>With</td><td style='padding:6px 0;'>" . htmlspecialchars($counterpart) . "</td></tr>
+                <tr><td style='padding:6px 0;color:#777;'>Date</td><td style='padding:6px 0;'>" . htmlspecialchars($date) . "</td></tr>
+                <tr><td style='padding:6px 0;color:#777;'>Time</td><td style='padding:6px 0;'>" . htmlspecialchars($time) . "</td></tr>
+                <tr><td style='padding:6px 0;color:#777;'>Type</td><td style='padding:6px 0;'>" . htmlspecialchars($type) . "</td></tr>
+                {$reasonRow}
+                {$cancelRow}
+            </table>
+            <p style='color:#777;font-size:13px;'>You're receiving this email because notifications are enabled for your PediCare account.</p>
+        ";
+    }
+}
