@@ -2581,6 +2581,5 @@ $calendar_appointments = get_all_appointments_for_calendar($conn);
     }
     <?php endif; ?>
     </script>
-    <script src="js/admin-dashboard.js"></script>
 </body>
 </html>
