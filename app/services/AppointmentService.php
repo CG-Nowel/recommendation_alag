@@ -384,15 +384,30 @@ class AppointmentService
 
         $titles = [
             'booked' => 'Appointment Booked',
-            'confirmed' => 'Appointment Confirmed',
+            'scheduled' => 'Appointment Scheduled',
+            'confirmed' => 'Appointment Approved',
             'cancelled' => 'Appointment Cancelled',
             'completed' => 'Appointment Completed',
             'in_progress' => 'Appointment In Progress',
             'no_show' => 'Appointment Marked No-Show',
             'waitlisted' => 'Appointment Waitlisted',
+            'rescheduled' => 'Appointment Updated',
+        ];
+
+        $verbs = [
+            'booked' => 'booked',
+            'scheduled' => 'scheduled',
+            'confirmed' => 'approved',
+            'cancelled' => 'cancelled',
+            'completed' => 'completed',
+            'in_progress' => 'started',
+            'no_show' => 'marked as no-show',
+            'waitlisted' => 'added to the waitlist',
+            'rescheduled' => 'updated',
         ];
 
         $title = $titles[$event] ?? 'Appointment Update';
+        $verb = $verbs[$event] ?? str_replace('_', ' ', $event);
         $date = date('M j, Y', strtotime($appointment['appointment_date']));
         $time = date('g:i A', strtotime($appointment['appointment_time']));
         $type = $appointment['type'] ?? 'CONSULTATION';
@@ -401,7 +416,7 @@ class AppointmentService
 
         // Notify parent (in-app + email)
         if ($parent) {
-            $parentMessage = "Appointment for {$appointment['patient_first_name']} on {$date} at {$time} has been {$event}.";
+            $parentMessage = "Appointment for {$appointment['patient_first_name']} on {$date} at {$time} has been {$verb}.";
 
             $this->notificationModel->createNotification(
                 (int) $parent['id'],
@@ -439,7 +454,7 @@ class AppointmentService
             $staff = $this->db->fetchAll(
                 "SELECT id FROM users WHERE user_type IN ('ADMIN', 'SUPERADMIN') AND status = 'active'"
             );
-            $staffMessage = "Parent updated appointment for {$patientName} with {$doctorName} on {$date} at {$time}: {$event}.";
+            $staffMessage = "Parent updated appointment for {$patientName} with {$doctorName} on {$date} at {$time}: {$verb}.";
             foreach ($staff as $s) {
                 $this->notificationModel->createNotification(
                     (int) $s['id'],
@@ -455,7 +470,7 @@ class AppointmentService
 
         // Notify doctor (in-app + email)
         if ($doctor) {
-            $doctorMessage = "Appointment with {$patientName} on {$date} at {$time} has been {$event}.";
+            $doctorMessage = "Appointment with {$patientName} on {$date} at {$time} has been {$verb}.";
 
             $this->notificationModel->createNotification(
                 (int) $doctor['id'],

@@ -30,37 +30,52 @@ class NotificationService
 
     /**
      * Send an email notification.
+     *
+     * Uses PHPMailer over SMTP when credentials are configured; otherwise
+     * falls back to the PHP mail() helper in smtp_mailer.php, which is the
+     * path the rest of the clinic app (OTP, appointment status updates) uses.
      */
     public function sendEmail(string $to, string $subject, string $body): bool
     {
-        if (empty($this->mailConfig['host']) || empty($this->mailConfig['username'])) {
-            // SMTP not configured, log and skip
-            error_log("Email sending skipped - SMTP not configured. To: $to, Subject: $subject");
+        $html = $this->wrapInTemplate($subject, $body);
+
+        if (!empty($this->mailConfig['host']) && !empty($this->mailConfig['username'])) {
+            try {
+                $mail = new \PHPMailer\PHPMailer\PHPMailer(true);
+                $mail->isSMTP();
+                $mail->Host = $this->mailConfig['host'];
+                $mail->SMTPAuth = true;
+                $mail->Username = $this->mailConfig['username'];
+                $mail->Password = $this->mailConfig['password'];
+                $mail->SMTPSecure = $this->mailConfig['encryption'];
+                $mail->Port = $this->mailConfig['port'];
+
+                $mail->setFrom($this->mailConfig['from']['address'], $this->mailConfig['from']['name']);
+                $mail->addAddress($to);
+                $mail->isHTML(true);
+                $mail->Subject = $subject;
+                $mail->Body = $html;
+                $mail->AltBody = strip_tags($body);
+
+                return $mail->send();
+            } catch (\Throwable $e) {
+                error_log("PHPMailer send failed, falling back to mail(): " . $e->getMessage());
+            }
+        }
+
+        if (!function_exists('smtp_send_email')) {
+            $mailerPath = dirname(__DIR__, 2) . '/smtp_mailer.php';
+            if (is_file($mailerPath)) {
+                require_once $mailerPath;
+            }
+        }
+
+        if (!function_exists('smtp_send_email')) {
+            error_log("Email sending skipped - no mailer available. To: $to, Subject: $subject");
             return false;
         }
 
-        try {
-            $mail = new \PHPMailer\PHPMailer\PHPMailer(true);
-            $mail->isSMTP();
-            $mail->Host = $this->mailConfig['host'];
-            $mail->SMTPAuth = true;
-            $mail->Username = $this->mailConfig['username'];
-            $mail->Password = $this->mailConfig['password'];
-            $mail->SMTPSecure = $this->mailConfig['encryption'];
-            $mail->Port = $this->mailConfig['port'];
-
-            $mail->setFrom($this->mailConfig['from']['address'], $this->mailConfig['from']['name']);
-            $mail->addAddress($to);
-            $mail->isHTML(true);
-            $mail->Subject = $subject;
-            $mail->Body = $this->wrapInTemplate($subject, $body);
-            $mail->AltBody = strip_tags($body);
-
-            return $mail->send();
-        } catch (\Throwable $e) {
-            error_log("Email send failed: " . $e->getMessage());
-            return false;
-        }
+        return smtp_send_email($to, '', $subject, $html, strip_tags($body));
     }
 
     /**
