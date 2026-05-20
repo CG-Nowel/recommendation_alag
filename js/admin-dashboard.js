@@ -222,6 +222,21 @@ function handleEditUser(event) {
         var el = document.getElementById(pair[0]);
         if (el) formData.append(pair[1], el.value || '');
     });
+
+    var pwdEl = document.getElementById('editUserPassword');
+    var newPassword = pwdEl ? pwdEl.value : '';
+    if (newPassword !== '') {
+        if (newPassword.length < 8
+            || !/[A-Z]/.test(newPassword)
+            || !/[a-z]/.test(newPassword)
+            || !/[0-9]/.test(newPassword)
+            || !/[!@#$%^&*()_+\-=\[\]{}|;:,.<>?]/.test(newPassword)) {
+            showNotification('Password must be at least 8 chars with upper, lower, digit, and symbol.', 'error');
+            return;
+        }
+        formData.append('new_password', newPassword);
+    }
+
     if (window.CSRF_TOKEN) formData.append('csrf_token', window.CSRF_TOKEN);
 
     fetch('admin-actions-secure.php', { method: 'POST', body: formData })

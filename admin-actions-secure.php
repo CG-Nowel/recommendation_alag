@@ -1093,10 +1093,16 @@ function handleUpdateUserProfile($conn) {
     mysqli_stmt_bind_param($log, "iss", $current_user_id, $details, $ip_address);
     mysqli_stmt_execute($log);
 
-    // Email the user that their account was updated by a SuperAdmin.
+    // Email the user that their account was updated by a SuperAdmin. When the
+    // password was changed, surface the new password in the email so the user
+    // can log in with it (they will be required to change it on next login).
     if (function_exists('send_user_notification')) {
         $msg = "Your AlagApp Clinic account profile was updated by a system administrator.";
         if (!empty($changes)) $msg .= "\n\nChanges: " . implode(', ', $changes);
+        if ($password_changed) {
+            $msg .= "\n\nYour new password is: " . $new_password;
+            $msg .= "\nYou will be required to change it on your next login.";
+        }
         $msg .= "\n\nIf you did not expect this change, please contact the clinic immediately.";
         send_user_notification($conn, $user_id, 'Your account was updated', $msg, 'SYSTEM');
     }
